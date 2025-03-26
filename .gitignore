@@ -1,0 +1,16 @@
+# Cache file
+members_cache.json
+revisions_cache_*.json
+
+# Output files
+space_team_members_stats.csv
+space_team_members_stats.png
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environment variables
+.env

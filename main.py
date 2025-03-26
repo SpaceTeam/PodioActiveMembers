@@ -20,6 +20,11 @@ class PodioClient:
         self.password = os.getenv("PODIO_PASSWORD")
         self.app_id = os.getenv("PODIO_APP_ID")
         self.access_token = None
+
+        # Create cache directory if it doesn't exist
+        self.cache_dir = "cache"
+        os.makedirs(self.cache_dir, exist_ok=True)
+
         self.authenticate()
         print("Podio client initialized")
 
@@ -51,7 +56,7 @@ class PodioClient:
 
     def get_all_members(self):
         """Get all members from the Podio app using direct API calls or cache"""
-        cache_file = "members_cache.json"
+        cache_file = os.path.join(self.cache_dir, "members_cache.json")
 
         # Check if cache file exists
         if os.path.exists(cache_file):
@@ -98,7 +103,7 @@ class PodioClient:
 
     def get_item_revisions(self, item_id):
         """Get revision history for an item, using cache if available"""
-        cache_file = f"revisions_cache_{item_id}.json"
+        cache_file = os.path.join(self.cache_dir, f"revisions_cache_{item_id}.json")
 
         # Check if cache file exists
         if os.path.exists(cache_file):
@@ -222,33 +227,157 @@ def extract_member_data(members):
                 f"  Member {members_with_join_dates[i]['name']}: {members_with_join_dates[i]['join_date']}"
             )
 
+    # After extracting status
+    # Add debug to show status distribution
+    status_counts = {}
+    for member in member_data:
+        status = member.get("status")
+        if status:
+            status_counts[status] = status_counts.get(status, 0) + 1
+
+    print("\nStatus distribution:")
+    for status, count in status_counts.items():
+        print(f"  {status}: {count} members")
+
     return member_data
 
 
 def find_status_change_dates(podio_client, member_data):
-    """Find dates when members' status changed to 'ausgetreten'"""
-    # Use the status field ID from the screenshot
+    """Find dates when members' status changed to 'ausgetreten' or similar"""
+    # Use the status field ID
     status_field_id = 216758721
-    ausgetreten_value = 4
 
-    for i, member in enumerate(member_data):
+    # Debug counters
+    members_processed = 0
+    members_with_leave_dates = 0
+
+    # Get all unique statuses
+    all_statuses = set(m.get("status") for m in member_data if m.get("status"))
+    print(f"\nAll statuses found: {all_statuses}")
+
+    # Try to identify statuses that indicate a member has left
+    potential_exit_statuses = [
+        s
+        for s in all_statuses
+        if any(
+            term in s.lower()
+            for term in ["aus", "exit", "left", "former", "ex-", "inactive"]
+        )
+    ]
+
+    print(f"Potential exit statuses: {potential_exit_statuses}")
+
+    # If we found potential exit statuses, use them; otherwise default to 'ausgetreten'
+    exit_statuses = (
+        potential_exit_statuses if potential_exit_statuses else ["ausgetreten"]
+    )
+    print(f"Using these statuses to identify members who left: {exit_statuses}")
+
+    # Check for members with exit status
+    exit_status_members = [m for m in member_data if m.get("status") in exit_statuses]
+    print(f"Found {len(exit_status_members)} members with exit status")
+
+    # Process revisions for members with exit status
+    for i, member in enumerate(exit_status_members):
         print(
-            f"Processing revisions for member {i + 1}/{len(member_data)} (ID: {member['item_id']})"
+            f"Processing revisions for member {i + 1}/{len(exit_status_members)} "
+            f"(ID: {member['item_id']}, Status: {member.get('status')})"
         )
         revisions = podio_client.get_item_revisions(member["item_id"])
+        members_processed += 1
+
+        # Debug: Print first revision structure if available
+        if i == 0 and revisions:
+            print("\nSample revision structure:")
+            print(json.dumps(revisions[0], indent=2)[:500] + "...")
+
+        # Look through revisions to find when status changed
+        leave_date = None
+        current_status = member.get("status")
 
         for revision in revisions:
-            # Check if this revision changed the status field
+            # Check if this revision contains status field changes
             if "data" in revision and "fields" in revision["data"]:
                 for field in revision["data"]["fields"]:
-                    if field.get("field_id") == status_field_id:  # Status field ID
-                        values = field.get("values", [])
-                        if values and values[0].get("value") == ausgetreten_value:
-                            member["leave_date"] = revision.get("created_on")
-                            break
+                    if field.get("field_id") == status_field_id:
+                        # This revision changed the status field
+                        old_values = field.get("old_values", [])
+                        new_values = field.get("values", [])
 
-            if member.get("leave_date"):
+                        # If we have both old and new values, check if this was the change to exit status
+                        if old_values and new_values:
+                            # Try to extract status text from values
+                            try:
+                                old_status = None
+                                new_status = None
+
+                                # Extract old status
+                                if "value" in old_values[0]:
+                                    old_value = old_values[0]["value"]
+                                    if (
+                                        isinstance(old_value, dict)
+                                        and "text" in old_value
+                                    ):
+                                        old_status = old_value["text"]
+                                    elif isinstance(old_value, (str, int)):
+                                        old_status = str(old_value)
+
+                                # Extract new status
+                                if "value" in new_values[0]:
+                                    new_value = new_values[0]["value"]
+                                    if (
+                                        isinstance(new_value, dict)
+                                        and "text" in new_value
+                                    ):
+                                        new_status = new_value["text"]
+                                    elif isinstance(new_value, (str, int)):
+                                        new_status = str(new_value)
+
+                                # If new status matches current exit status, this is when they left
+                                if new_status and new_status == current_status:
+                                    leave_date = revision.get("created_on")
+                                    print(
+                                        f"  Found status change: {old_status} -> {new_status}"
+                                    )
+                                    break
+                            except Exception as e:
+                                print(f"  Error parsing status values: {e}")
+
+            if leave_date:
                 break
+
+        # If we found a leave date, update the member data
+        if leave_date:
+            member["leave_date"] = leave_date
+            members_with_leave_dates += 1
+            print(
+                f"  Found leave date for {member.get('name', 'Unknown')}: {leave_date}"
+            )
+        else:
+            # If we couldn't find when they left, use their last update date as an approximation
+            if revisions:
+                # Use the most recent revision date as an approximation
+                approx_date = revisions[0].get("created_on")
+                member["leave_date"] = approx_date
+                members_with_leave_dates += 1
+                print(
+                    f"  Using approximate leave date for {member.get('name', 'Unknown')}: {approx_date}"
+                )
+
+    print(
+        f"\nProcessed {members_processed} members, found {members_with_leave_dates} with leave dates"
+    )
+
+    # Debug: Show some examples of members who have left
+    left_members = [m for m in member_data if m.get("leave_date")]
+    if left_members:
+        print("\nSample of members who have left:")
+        for i in range(min(5, len(left_members))):
+            print(
+                f"  {left_members[i].get('name', 'Unknown')}: "
+                f"Status: {left_members[i].get('status')}, "
+                f"Left: {left_members[i]['leave_date']}"
+            )
 
     return member_data
 
@@ -296,6 +425,9 @@ def calculate_monthly_stats(member_data):
         month_end = month_start + relativedelta(months=1) - timedelta(seconds=1)
 
         active_count = 0
+        joined_count = 0
+        left_count = 0
+
         for member in member_data:
             if not member["join_date"]:
                 continue
@@ -304,19 +436,41 @@ def calculate_monthly_stats(member_data):
                 member["join_date"].replace("Z", "+00:00")
             )
 
-            # Check if member was active during this month
+            # Check if member joined before or during this month
             if join_date <= month_end:
-                if (
-                    not member["leave_date"]
-                    or datetime.fromisoformat(
+                joined_count += 1
+
+                # Check if member has left
+                if member["leave_date"]:
+                    leave_date = datetime.fromisoformat(
                         member["leave_date"].replace("Z", "+00:00")
                     )
-                    > month_end
-                ):
+
+                    # If they left before or during this month, count them as left
+                    if leave_date <= month_end:
+                        left_count += 1
+                    # Otherwise they're still active this month
+                    else:
+                        active_count += 1
+                else:
+                    # No leave date, so they're still active
                     active_count += 1
 
+        # Double-check our math: active should equal joined minus left
+        if active_count != (joined_count - left_count):
+            print(
+                f"Warning: Math error for {month_start.strftime('%Y-%m')}: "
+                f"Active={active_count}, Joined={joined_count}, Left={left_count}"
+            )
+            active_count = joined_count - left_count
+
         monthly_counts.append(
-            {"month": month_start.strftime("%Y-%m"), "active_members": active_count}
+            {
+                "month": month_start.strftime("%Y-%m"),
+                "active_members": active_count,
+                "total_joined": joined_count,
+                "total_left": left_count,
+            }
         )
 
     return monthly_counts
